@@ -50,6 +50,9 @@ namespace WeaponPaints
 		[JsonPropertyName("CommandSkin")]
 		public List<string> CommandSkin { get; set; } = ["ws"];
 
+		[JsonPropertyName("CommandSkinSearch")]
+		public List<string> CommandSkinSearch { get; set; } = ["skin"];
+
 		[JsonPropertyName("CommandSkinSelection")]
 		public List<string> CommandSkinSelection { get; set; } = ["skins"];
 

@@ -1,5 +1,6 @@
 ﻿using System.Collections.Concurrent;
 using CounterStrikeSharp.API;
+using FuzzySharp;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Menu;
@@ -125,7 +126,16 @@ public partial class WeaponPaints
 				OnCommandWS(player, info);
 			});
 		});
-			
+
+		_config.Additional.CommandSkinSearch.ForEach(c =>
+		{
+			AddCommand($"css_{c}", "Search and apply skin by name", (player, info) =>
+			{
+				if (!Utility.IsPlayerValid(player)) return;
+				OnCommandSkinSearch(player, info);
+			});
+		});
+
 		_config.Additional.CommandRefresh.ForEach(c =>
 		{
 			AddCommand($"css_{c}", "Skins refresh", (player, info) =>
@@ -1024,12 +1034,138 @@ public partial class WeaponPaints
 					pinsSelectionMenu.Open(player);
 					return;
 				}
-				
+
 				if (!string.IsNullOrEmpty(Localizer["wp_command_cooldown"]))
 				{
 					player.Print(Localizer["wp_command_cooldown"]);
 				}
 			});
 		});
+	}
+
+	private void OnCommandSkinSearch(CCSPlayerController? player, CommandInfo command)
+	{
+		if (!Config.Additional.SkinEnabled || !_gBCommandsAllowed) return;
+		if (player == null || !player.IsValid || player.UserId == null) return;
+
+		var query = command.ArgString.Trim();
+		if (string.IsNullOrEmpty(query))
+		{
+			player.Print("Usage: !skin <name>  e.g. !skin ak47 redline, !skin karambit doppler");
+			return;
+		}
+
+		// Cooldown check
+		if (CommandsCooldown.TryGetValue(player.Slot, out var cooldownEnd) && DateTime.UtcNow < cooldownEnd)
+		{
+			if (!string.IsNullOrEmpty(Localizer["wp_command_cooldown"]))
+				player.Print(Localizer["wp_command_cooldown"]);
+			return;
+		}
+		CommandsCooldown[player.Slot] = DateTime.UtcNow.AddSeconds(Config.CmdRefreshCooldownSeconds);
+
+		var queryLower = query.ToLowerInvariant();
+
+		JObject? bestSkin = null;
+		int bestScore = 0;
+
+		foreach (var skin in SkinsList)
+		{
+			var paintName = skin["paint_name"]?.ToString();
+			var defindex = ((int?)skin["weapon_defindex"] ?? 0);
+
+			if (string.IsNullOrEmpty(paintName) || defindex == 0) continue;
+			if (!WeaponDefindex.TryGetValue(defindex, out var entityName)) continue;
+
+			// Full display name: "Desert Eagle" + "Forest DDPAT" → "desert eagle forest ddpat"
+			var displayName = WeaponList.TryGetValue(entityName, out var dn) ? dn : entityName;
+			var candidateFull = $"{displayName} {paintName}".ToLowerInvariant();
+
+			// Short entity name: "weapon_knife_karambit" → "karambit", "weapon_deagle" → "deagle"
+			var shortName = entityName.Replace("weapon_knife_", "").Replace("weapon_", "");
+			var candidateShort = $"{shortName} {paintName}".ToLowerInvariant();
+
+			var score = Math.Max(
+				Fuzz.WeightedRatio(queryLower, candidateFull),
+				Fuzz.WeightedRatio(queryLower, candidateShort)
+			);
+
+			if (score > bestScore)
+			{
+				bestScore = score;
+				bestSkin = skin;
+			}
+		}
+
+		if (bestScore < 60 || bestSkin == null)
+		{
+			player.Print("Skin no encontrada. Intenta ser más específico (ej: !skin ak47 redline).");
+			return;
+		}
+
+		var weaponDefIndex = ((int?)bestSkin["weapon_defindex"] ?? 0);
+		var bestPaintId = ((int?)bestSkin["paint"] ?? 0);
+		var bestPaintName = bestSkin["paint_name"]?.ToString() ?? "";
+
+		WeaponDefindex.TryGetValue(weaponDefIndex, out var bestEntityName);
+		var isKnife = bestEntityName != null &&
+		              (bestEntityName.Contains("knife") || bestEntityName == "weapon_bayonet");
+
+		var teamsToCheck = player.TeamNum < 2
+			? new[] { CsTeam.Terrorist, CsTeam.CounterTerrorist }
+			: [player.Team];
+
+		// Always set the paint in GPlayerWeaponsInfo
+		var playerSkins = GPlayerWeaponsInfo.GetOrAdd(player.Slot, _ => new ConcurrentDictionary<CsTeam, ConcurrentDictionary<int, WeaponInfo>>());
+		foreach (var team in teamsToCheck)
+		{
+			var teamWeapons = playerSkins.GetOrAdd(team, _ => new ConcurrentDictionary<int, WeaponInfo>());
+			var weaponInfo = teamWeapons.GetOrAdd(weaponDefIndex, _ => new WeaponInfo());
+			weaponInfo.Paint = bestPaintId;
+			weaponInfo.Wear = 0.01f;
+			weaponInfo.Seed = 0;
+		}
+
+		// For knives, also set the knife type so RefreshWeapons gives the right model
+		if (isKnife && Config.Additional.KnifeEnabled && bestEntityName != null)
+		{
+			var playerKnives = GPlayersKnife.GetOrAdd(player.Slot, new ConcurrentDictionary<CsTeam, string>());
+			foreach (var team in teamsToCheck)
+				playerKnives[team] = bestEntityName;
+		}
+
+		// Build player info for DB sync
+		var playerInfo = new PlayerInfo
+		{
+			UserId = player.UserId,
+			Slot = player.Slot,
+			Index = (int)player.Index,
+			SteamId = player.SteamID.ToString(),
+			Name = player.PlayerName,
+			IpAddress = player.IpAddress?.Split(":")[0]
+		};
+
+		if (WeaponSync != null)
+		{
+			try
+			{
+				_ = Task.Run(async () => await WeaponSync.SyncWeaponPaintsToDatabase(playerInfo));
+
+				if (isKnife && Config.Additional.KnifeEnabled && bestEntityName != null)
+					_ = Task.Run(async () => await WeaponSync.SyncKnifeToDatabase(playerInfo, bestEntityName, teamsToCheck));
+			}
+			catch (Exception ex)
+			{
+				Utility.Log($"Error syncing skin: {ex.Message}");
+			}
+		}
+
+		if ((LifeState_t)player.LifeState == LifeState_t.LIFE_ALIVE)
+			RefreshWeapons(player);
+
+		var weaponDisplay = bestEntityName != null && WeaponList.TryGetValue(bestEntityName, out var wdn)
+			? wdn
+			: weaponDefIndex.ToString();
+		player.Print($"Skin aplicada: {weaponDisplay} | {bestPaintName}  (score: {bestScore})");
 	}
 }
